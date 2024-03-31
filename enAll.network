@@ -1,0 +1,30 @@
+[Match]
+# Toutes interfaces ethernet, supposé être unique cependant
+Name=en*
+
+[Link]
+#MACAddress=Changer l'adresse MAC
+#MTUBytes=Changer la valeur du MTU
+RequiredForOnline=yes
+RequiredFamilyForOnline=ipv4
+
+
+[Network]
+DHCP=ipv4
+# voir man, pour ipv4 uniquement ici
+
+
+LinkLocalAddressing=no
+# on ne veut pas voir d'IP en 169.254 ici
+
+# Notes sur l'utilisation du DHCP de systemd-networkd
+# UseDNS=true par défaut -> si le DHCP renvoie un DNS, il sera utilisé
+# UseNTP=true, idem, et plein d'autres, voir man systemd.network
+
+#Address=IP fixe (si DHCP non actif, avec masque en notation CIDR)
+#Gateway=IP du routeur (si DHCP non actif)
+#DNS=192.168.3.232
+
+# Normalement pas d'effet si IPv6 désactivé dans le noyau
+IPv6AcceptRA=no
+IPv6SendRA=no

@@ -1,0 +1,443 @@
+---
+# Master de Debian 12 durcit selon règles ANSSI
+#
+# https://cyber.gouv.fr/sites/default/files/document/fr_np_linux_configuration-v2.0.pdf
+#
+# Ce playbook s'applique à une Debian 12 Bookworm avec installation minimale 
+#    + ssh (demander dans debian-installer) + python3 (ajouter ensuite)
+# ansible-playbook ./step3.yml --ask-pass --ask-become-pass -i inventory.ini
+
+
+# Notes :  
+# - la clé SSH d'hôte n'est pas gérée, il faut l'avoir importé avant de jouer le script
+# - Bien rebooter après car il y a des paramètres sysctl.conf à prendre en compte
+
+- hosts: masterBookworm
+  remote_user: startup
+  become_user: root
+  tasks:
+
+    ############ 
+    # Divers système apt et ansible
+  - name: Supprime le CD comme source APT
+    become: true
+    ansible.builtin.apt_repository:
+      repo: deb cdrom:[Debian GNU/Linux bullseye-DI-rc2 _Bullseye_ - Official Snapshot amd64 DVD Binary-1 20210607-15:57] bullseye contrib main
+      state: absent
+      
+      # TODO : Mettre à jour
+      # Idée sympa : 
+      #  - avoir un volume RO monté dans toutes les VM avec les support d'installation
+      #  - débit out-of-band (SAN)
+      #  - surtout, disponible sans ouverture de ports
+      #  - en RW uniquement par une VM qui a pour seul travail de faire un rsync quotidien des dépôts -> on coche la règle "dépôts sécurisés"
+      
+  - name: Ajout source APT chez Proxad
+    become: true
+    ansible.builtin.apt_repository:
+      repo: deb http://debian.proxad.net/debian bookworm main contrib 
+      state: present
+
+  - name: Mise à jour Debian cache apt
+    become: true
+    ansible.builtin.apt:
+      update-cache: true
+      upgrade: full
+
+  - name: Installation aptitude car Ansible semble préférer
+    become: true
+    ansible.builtin.apt:
+      name: aptitude
+      state: present
+
+  - name: Install unattended-upgrade
+    become: true
+    ansible.builtin.apt:
+      name: unattended-upgrades
+      state: present
+    # Notes : 
+    # - start et enable à la fin du playbook
+    # - Sur l'utilisation apt/unattended-upgrade avec les partitions RO/noexec
+    #    - le chmod 0711 /tmp fait planter apt update -> Trop restrictif, on s'abstient
+    #    - le noexec sur /var fait bloquer dpkg --remove
+    #        solution ici : https://askubuntu.com/questions/1452390/install-packages-on-systems-with-secured-tmp-and-var-noexec
+    #        voir le 10pre-post-hardened dans le § points de montage
+    #        Certainement des recettes applicables à un /usr en lecture seule également
+    # 
+    # TODO :
+    # - vérifier la config unattended-upgrade, si elle nous convient
+    # - Unattended-Upgrade::Mail ""; dans /etc/apt/apt.conf.d/50unattended-upgrades
+    # - faire la conf pour éviter les installations par défaut des "recommanded packages"
+
+
+    #####################################################
+    # Guest agent virtualisation pour qemu/KVM/Proxmox seulement
+    # apt install qemu-guest-agent
+    # systemctl start qemu-guest-agent
+    #
+    # Ne marche pas, on voit le problème en lançant /sbin/qemu-ga pour tests
+    # Il manque un module, un /dev n'est pas créé
+    # Tombe en marche après avoir mis ceci :
+    # # cat /etc/modules-load.d/modules.conf 
+    # virtio
+    # virtio_console
+    # virtio_balloon
+    # virtio_net
+    # virtio_scsi
+    # virtio_pci
+    # virtio_ring
+    # -> TODO si on veut travailler avec Proxmox
+
+
+    
+
+    #####################################################
+    # Getty sur interface série, pratique depuis l'hyperviseur
+    # Idée : fixer le Mdp de root, qui pourra encore être utilisé depuis console et ttyS0
+  - name: Getty sur console série
+    become: true
+    ansible.builtin.systemd:
+      state: started
+      enabled: true
+      name: serial-getty@ttyS0.service
+
+    #####################################################
+    # Composants sécurité du système, bas niveau
+  - name: Installation nftables, auditd, apparmor, apparmor-easyprof, apparmor-profiles, seccomp, libseccomp2, keyutils
+    become: true
+    ansible.builtin.apt:
+      name: nftables, auditd, apparmor, apparmor-easyprof, apparmor-profiles, seccomp, libseccomp2, keyutils
+      state: present
+
+  - name: Enforce les principaux profils apparmor existants
+    become: true
+    block:
+     - ansible.builtin.shell: aa-enforce php-fpm
+     - ansible.builtin.shell: aa-enforce samba-bgqd
+     - ansible.builtin.shell: aa-enforce samba-dcerpcd
+     - ansible.builtin.shell: aa-enforce samba-rpcd
+     - ansible.builtin.shell: aa-enforce samba-rpcd-classic
+     - ansible.builtin.shell: aa-enforce samba-rpcd-spoolss
+     - ansible.builtin.shell: aa-enforce smbd
+     - ansible.builtin.shell: aa-enforce smbldap-useradd
+     - ansible.builtin.shell: aa-enforce nmbd
+     - ansible.builtin.shell: aa-enforce nscd
+    # le profil php-fpm est installé à l'avance, et apache2 ne l'est pas... c'est comme ça !
+
+    # Ici les setrlimit() https://manpages.debian.org/bookworm/libpam-modules/limits.conf.5.en.html
+    # /etc/security/limits.d
+    # par clair par session ou par processus... On voudrait par processus
+        
+    # Yama  -> a priori, pas de package, compilé par défaut, uniquement activation sysctl
+    # lockdown -> pas de package, activé via l'UEFI secure boot (https://wiki.debian.org/SecureBoot)
+
+    #####################################################
+    # Configration de auditd
+    # inspiration dans /usr/share/doc/auditd/examples/rules/
+    # - le guide ANSSI
+    # - 30-nispom.rules — Audit rule configuration that meets the requirements specified in the Information System
+    #    Security chapter of the National Industrial Security Program Operating Manual.
+    # - 30-pci-dss-v31.rules — Audit rule configuration that meets the requirements set by Payment Card Industry Data Security Standard (PCI DSS) v3.1.
+    # - 30-stig.rules - Audit rule configuration that meets the requirements set by Security Technical Implementation Guides (STIG)
+  - name: Configuration Auditd
+    become: true
+    block:
+     - ansible.builtin.copy:
+         src: audit.rules
+         dest: /etc/audit/audit.rules
+         owner: root
+         group: root
+         mode: '0600'
+         backup: true
+    # Le systemctl enable est fait à la fin du playbook
+
+
+    #####################################################
+    # Toutes les variables sysctl
+  - name: Maj sysctl.conf
+    become: true
+    block:
+     - ansible.posix.sysctl: ignoreerrors=true name=l1tf value=full,force
+     - ansible.posix.sysctl: ignoreerrors=true name=page_poison  value=on
+     - ansible.posix.sysctl: ignoreerrors=true name=pti  value=on
+     - ansible.posix.sysctl: ignoreerrors=true name=slab_nomerge value=yes
+     - ansible.posix.sysctl: ignoreerrors=true name=slub_debug  value=FZP
+     - ansible.posix.sysctl: ignoreerrors=true name=spec_store_bypass_disable value=seccomp
+     - ansible.posix.sysctl: ignoreerrors=true name=spectre_v2  value=on
+     - ansible.posix.sysctl: ignoreerrors=true name=mds  value=full,nosmt
+     - ansible.posix.sysctl: ignoreerrors=true name=mce  value=0
+     - ansible.posix.sysctl: ignoreerrors=true name=page_alloc.shuffle value=1
+     - ansible.posix.sysctl: ignoreerrors=true name=rng_core.default_quality value=500
+     - ansible.posix.sysctl: ignoreerrors=true name=kernel.dmesg_restrict value=1
+     - ansible.posix.sysctl: ignoreerrors=true name=kernel.kptr_restrict value=2
+     - ansible.posix.sysctl: ignoreerrors=true name=kernel.pid_max  value=1000000
+     - ansible.posix.sysctl: ignoreerrors=true name=kernel.perf_cpu_time_max_percent value=1
+     - ansible.posix.sysctl: ignoreerrors=true name=kernel.perf_event_max_sample_rate value=1
+     - ansible.posix.sysctl: ignoreerrors=true name=kernel.perf_event_paranoid  value=2
+     - ansible.posix.sysctl: ignoreerrors=true name=kernel.randomize_va_space  value=2
+     - ansible.posix.sysctl: ignoreerrors=true name=kernel.sysrq value=0
+     - ansible.posix.sysctl: ignoreerrors=true name=kernel.unprivileged_bpf_disabled value=1
+     - ansible.posix.sysctl: ignoreerrors=true name=kernel.panic_on_oops  value=1
+     - ansible.posix.sysctl: ignoreerrors=true name=kernel.modules_disabled value=1
+     - ansible.posix.sysctl: ignoreerrors=true name=kernel.yama.ptrace_scope value=3
+     - ansible.posix.sysctl: ignoreerrors=true name=net.core.bpf_jit_harden value=2
+     - ansible.posix.sysctl: ignoreerrors=true name=net.ipv4.ip_forward value=0
+     - ansible.posix.sysctl: ignoreerrors=true name=net.ipv4.icmp_ignore_bogus_error_responses value=1
+     - ansible.posix.sysctl: ignoreerrors=true name=net.ipv4.conf.all.accept_local value=0
+     - ansible.posix.sysctl: ignoreerrors=true name=net.ipv4.conf.all.accept_redirects  value=0
+     - ansible.posix.sysctl: ignoreerrors=true name=net.ipv4.conf.default.accept_redirects value=0
+     - ansible.posix.sysctl: ignoreerrors=true name=net.ipv4.conf.all.secure_redirects  value=0
+     - ansible.posix.sysctl: ignoreerrors=true name=net.ipv4.conf.default.secure_redirects value=0
+     - ansible.posix.sysctl: ignoreerrors=true name=net.ipv4.conf.all.shared_media  value=0
+     - ansible.posix.sysctl: ignoreerrors=true name=net.ipv4.conf.default.shared_media  value=0
+     - ansible.posix.sysctl: ignoreerrors=true name=net.ipv4.conf.all.accept_source_route value=0
+     - ansible.posix.sysctl: ignoreerrors=true name=net.ipv4.conf.default.accept_source_route value=0
+     - ansible.posix.sysctl: ignoreerrors=true name=net.ipv4.conf.all.arp_filter value=1
+     - ansible.posix.sysctl: ignoreerrors=true name=net.ipv4.conf.all.arp_ignore value=2
+     - ansible.posix.sysctl: ignoreerrors=true name=net.ipv4.conf.all.route_localnet  value=0
+     - ansible.posix.sysctl: ignoreerrors=true name=net.ipv4.conf.all.drop_gratuitous_arp value=1
+     - ansible.posix.sysctl: ignoreerrors=true name=net.ipv4.conf.default.rp_filter  value=1
+     - ansible.posix.sysctl: ignoreerrors=true name=net.ipv4.conf.all.rp_filter value=1
+     - ansible.posix.sysctl: ignoreerrors=true name=net.ipv4.conf.default.send_redirects value=0
+     - ansible.posix.sysctl: ignoreerrors=true name=net.ipv4.conf.all.send_redirects value=0
+     - ansible.posix.sysctl: ignoreerrors=true name=net.ipv4.ip_local_port_range value="32768 65535"
+     - ansible.posix.sysctl: ignoreerrors=true name=net.ipv4.tcp_rfc1337   value=1
+     - ansible.posix.sysctl: ignoreerrors=true name=net.ipv4.tcp_syncookies   value=1
+     - ansible.posix.sysctl: ignoreerrors=true name=net.ipv6.conf.default.disable_ipv6 value=1
+     - ansible.posix.sysctl: ignoreerrors=true name=net.ipv6.conf.all.disable_ipv6 value=1
+     - ansible.posix.sysctl: ignoreerrors=true name=fs.suid_dumpable   value=0
+     - ansible.posix.sysctl: ignoreerrors=true name=fs.protected_fifos  value=2
+     - ansible.posix.sysctl: ignoreerrors=true name=fs.protected_regular value=2
+     - ansible.posix.sysctl: ignoreerrors=true name=fs.protected_symlinks value=1
+     - ansible.posix.sysctl: ignoreerrors=true name=fs.protected_hardinks value=1
+
+
+    #####################################################
+    # Options systèmes de fichiers, fstab
+    #
+    # ansible.posix.mount ne semble adapté que quand on a toutes les infos à donner à partir de rien, pas pour modifier une entrée existante
+    # Module "optionsFstab" développé maison d'après la doc :
+    # https://docs.ansible.com/ansible/latest/dev_guide/developing_modules_general.html
+    # TODO : est-ce qu'on ajouterait pas des noatime parfois ?
+  - name: pam-tmpdir
+    become: true
+    block:
+     - ansible.builtin.apt:
+         name: libpam-tmpdir
+         state: present
+          
+     - ansible.builtin.file:
+         path: /tmp
+         mode: '01777'
+    # pam_tmpdir créé et renseigne dans TMP et TMPDIR le chemin /tmp/usr/$PID en 0711
+    # Mais les processus sans session continuent d'utiliser /tmp historique même avec un compte de service non priv. P.ex. unattended-upgrades + _apt
+    # On ne sait pas faire mieux que le "drwxrwxrwt"=01777 par défaut de /tmp historique
+
+  - name: proc/hidepid
+    become: true
+    ansible.posix.mount:
+      path: /proc
+      src: /proc
+      fstype: proc
+      opts: remount,hidepid=2
+      state: mounted
+        
+  - name: Options fstab
+    become: true
+    block:
+      - optionsFstab: path=/tmp           options="+nosuid +nodev +noexec +errors=remount-ro -defaults" backup=/etc/fstab.bak
+      - optionsFstab: path=/boot          options="+nosuid +nodev +noexec +errors=remount-ro -defaults"
+      - optionsFstab: path=/opt           options="+nosuid +nodev         +errors=remount-ro -defaults"
+      - optionsFstab: path=/srv           options="+nosuid +nodev         +errors=remount-ro -defaults"
+      - optionsFstab: path=/home          options="+nosuid +nodev +noexec +errors=remount-ro -defaults"
+      - optionsFstab: path=/usr           options="        +nodev         +errors=remount-ro -defaults"
+      - optionsFstab: path=/var           options="+nosuid +nodev +noexec +errors=remount-ro -defaults"
+      - optionsFstab: path=/var/log       options="+nosuid +nodev +noexec +errors=remount-ro -defaults"
+      - optionsFstab: path=/var/log/audit options="+nosuid +nodev +noexec +errors=remount-ro -defaults"
+      - ansible.builtin.file:
+          path: /boot
+          mode: '0700'
+
+      - ansible.builtin.copy: # Pour que APT supporte les volumes montés en noexec
+          src: 10pre-post-hardened
+          dest: /etc/apt/apt.conf.d/10pre-post-hardened
+          owner: root
+          group: root
+          mode: '0644'
+
+    # Note sur le "noauto" sur /boot qui ne marche pas. Explication ici :
+    # https://unix.stackexchange.com/questions/490231/why-does-a-partition-marked-as-noauto-still-mount-on-boot
+    # C'est bien ça qui pose rpoblème, il a détecté une dépendance, donc systemd le monte quand même :
+    # # systemctl --reverse list-dependencies boot.mount
+    #boot.mount
+    #● └─unattended-upgrades.service
+
+
+    #####################################################
+    # sudo
+  - name: Install/config sudo
+    become: true
+    ansible.builtin.apt: name=sudo state=present
+    # TODO : durée max pour une session sudo pas bien longue
+
+
+    #####################################################
+    # SSH
+    # Clé d'hôte : générer maintenant ? pas forcément
+    # User par défaut
+    # TODO : pas de ssh root direct
+    # A utiliser mais en plus court : ClientAliveInterval  1200 / ClientAliveCountMax 3
+    # S'occuper des causes de lenteur : désactiver GSSAPI si pas utilisé, lookup reverse DNS...
+
+
+    #####################################################
+    # Sécu middleW
+  - name: Installation openssl
+    become: true
+    ansible.builtin.apt: name=openssl state=present
+
+#  - name: Installation python3-openssl
+#    become: yes
+#    apt: name=python3-openssl state=present
+# Non pourquoi ?
+
+    #####################################################
+    # Passe la config réseau en systemd
+    # Par défaut, debian-installer a configuré /etc/network/interfaces et un dhclient (= de l'ISC) tourne -> à supprimer
+    # A mettre : /etc/systemd/network/enAll.network
+  - name: Utilisation de systemd pour la conf réseau
+    become: true
+    block:
+     - ansible.builtin.copy:
+         src: enAll.network
+         dest: /etc/systemd/network/enAll.network
+         owner: root
+         group: root
+         mode: '0644'
+
+     #- ansible.builtin.shell: echo -e -n 'auto lo\niface lo inet loopback\n' > /etc/network/interfaces
+     # Syntaxe foireuse, ça marche pas, on fait une copy à la place 
+     - ansible.builtin.copy:
+         src: interfaces
+         dest: /etc/network/interfaces
+         owner: root
+         group: root
+         mode: '0644'
+
+     - ansible.builtin.apt:
+         name: isc-dhcp-client, isc-dhcp-common
+         state: absent
+
+
+    ######################################################
+    # Divers trucs
+    #
+    # umask par défaut 022 -> 027 voir https://www.debian.org/doc/manuals/securing-debian-manual/ch04s11.en.html
+    #  dans /etc/profile pour ce qui execute .bashrc   Créer un fichier dans /etc/profile.d/xxx.sh :
+    #    $ cat /etc/profile.d/tmout-umask.sh
+    #    export TMOUT=900
+    #    umask 027
+    #  dans /etc/login.defs pour ce qui utilise login
+    #
+    #  timeoutd a l'air d'être obsolète : https://tracker.debian.org/pkg/timeoutd
+    #
+    # Durée de session dans /etc/profile - bashrc  man bash variable TMOUT voir https://www.it-connect.fr/gestion-du-temps-dinactivite-dun-shell/
+    # ou plutôt via config pam / logind, est-ce vraiment nécessaire ?
+    # Durée de session sudo vue plus haut
+  - name: Umask et bash TMOUT
+    become: true
+    ansible.builtin.shell: 'echo "export TMOUT=900\numask 027\n" > /etc/profile.d/tmout-umask.sh'
+
+
+    #####################################################
+    # ntp à passer en systemd plutôt que démon
+    # historique
+  - name: Suppression ntpd qu'on utilise pas
+    become: true
+    ansible.builtin.apt:
+      name: sntp, ntp, openntpd
+      state: absent
+
+  - name: Install/conf systemd-timesyncd
+    become: true
+    ansible.builtin.apt: name=systemd-timesyncd state=present
+
+  - name: Copie conf systemd-timesyncd
+    become: true
+    ansible.builtin.copy:
+      src: timesyncd.conf
+      dest: /etc/systemd/timesyncd.conf
+      owner: root
+      group: root
+      mode: '0644'
+
+    #####################################################
+    # snmpd
+    # TODO : tout !
+
+    #####################################################
+    # rsyslogd et configuration des logs
+  - name: Install/conf rsyslogd
+    become: true
+    ansible.builtin.apt: name=rsyslog state=present
+
+    #####################################################
+    # Hostname, motd, issue temporaires
+    # pour le template
+    # TODO : voir si on en a besoin ici...
+    
+
+    #####################################################
+    # Agents divers : Zabbix et Wazuh
+    # TODO
+
+
+    #####################################################
+    # Config GRUB : mot de passe si on veut faire autre
+    # chose que booter un noyau+params prédéfinis, mais ça semble compliqué :
+    #  https://askubuntu.com/questions/631317/restricting-on-the-fly-editing-of-grub2-menuentries
+    # Doc officielle :
+    #  https://www.gnu.org/software/grub/manual/grub/html_node/Simple-configuration.html
+    #
+    # TODO
+    # Enlever le quiet et réactiver GRUB_TERMINAL=console
+    
+
+    #####################################################
+    # Packages interdits
+    # s'assurer qu'ils sont absents
+  - name: Suppression des packages interdits
+    become: true
+    ansible.builtin.apt:
+      name: cups, avahi-daemon, wpasupplicant, libpolkit-agent-1-0
+      state: absent
+
+    #####################################################
+    # Démarrage de tous les services
+    # Avec un daemon-reload pour le dernier, pour traiter les modifs faites ci-dessus
+  - name: Redémarrage de tous les services
+    become: true
+    block:
+      - ansible.builtin.systemd:
+          state: started
+          enabled: true
+          name: ssh
+      - ansible.builtin.systemd:
+          state: started
+          enabled: true
+          name: systemd-timesyncd
+      - ansible.builtin.systemd:
+          state: started
+          enabled: true
+          name: auditd.service
+      - ansible.builtin.systemd:
+          state: started
+          enabled: true
+          name: unattended-upgrades 
+          daemon_reload: true     # Un daemon-reload global
+      - ansible.builtin.systemd:  # Network en dernier, on va perdre la main !
+          enabled: true           # pas de state: start pour éviter de perdre la main
+          name: systemd-networkd  # mais il faudra rebooter évidemment
+
+  - ansible.builtin.debug:
+      msg: Pensez à rebooter pour prise en compte de tout (sysctl...) !

@@ -1,0 +1,5 @@
+auto lo
+iface lo inet loopback
+
+# Autres interfaces gérées par systemd, voir dans /etc/systemd/network
+
