@@ -1,4 +1,6 @@
 # Remet /var et /tmp en exec pendant l'utilisation de dpkg
 # On pourrait faire de même pour avoir le /usr en ro
-DPkg::Pre-Install-Pkgs {"mount -o remount,exec /tmp"; "mount -o remount,exec /var";};
-DPkg::Post-Invoke {"mount -o remount /tmp"; "mount -o remount /var";};
+DPkg::Pre-Install-Pkgs {"mount -o remount,exec /tmp"; "mount -o remount,exec /var"; "mount -o remount,exec /boot"; "mount -o remount,exec /home";};
+DPkg::Post-Invoke {"mount -o remount /tmp"; "mount -o remount /var"; "mount -o remount /boot"; "mount -o remount /home"; };
+
+
